@@ -1,0 +1,3 @@
+We are creating a GUI interface in Rust where we can paste a link, acquire youtube video codecs and details, choose one and download it either as a video or sound only mp3.
+
+We will use yt-dlp to download the media. We will have it next to our exe.
