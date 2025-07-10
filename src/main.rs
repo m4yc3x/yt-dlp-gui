@@ -9,6 +9,9 @@ use std::io::{BufRead, BufReader};
 use anyhow::Result;
 use regex::Regex;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VideoInfo {
     title: String,
@@ -521,9 +524,11 @@ fn get_video_info(url: &str, progress_sender: &mpsc::Sender<AppMessage>) -> Resu
     
     progress_sender.send(AppMessage::ConsoleOutput(format!("Running: {} --dump-json --no-playlist {}", yt_dlp_path.display(), url))).ok();
     
-    let output = Command::new(&yt_dlp_path)
-        .args(&["--dump-json", "--no-playlist", url])
-        .output()?;
+    let mut command = Command::new(&yt_dlp_path);
+    command.args(&["--dump-json", "--no-playlist", url]);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x08000000);
+    let output = command.output()?;
 
     if !output.status.success() {
         let error_msg = String::from_utf8_lossy(&output.stderr);
@@ -618,11 +623,13 @@ fn download_video(
     let command_str = format!("{} {}", yt_dlp_path.display(), args.join(" "));
     progress_sender.send(AppMessage::ConsoleOutput(format!("Running: {}", command_str))).ok();
     
-    let mut child = Command::new(&yt_dlp_path)
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut command = Command::new(&yt_dlp_path);
+    command.args(&args);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x08000000);
+    let mut child = command.spawn()?;
 
     // Read stdout in a separate thread to parse progress
     let stdout = child.stdout.take().unwrap();
