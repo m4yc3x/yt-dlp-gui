@@ -8,6 +8,8 @@ use std::thread;
 use std::io::{BufRead, BufReader};
 use anyhow::Result;
 use regex::Regex;
+use std::sync::{Arc, Mutex};
+use std::path::Path;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -189,7 +191,7 @@ impl YtMp3App {
                     AppMessage::DownloadComplete(result) => {
                         match result {
                             Ok(path) => {
-                                self.state = AppState::Success(format!("✅ Download completed successfully!\nSaved to: {}", path));
+                                self.state = AppState::Success(path);
                             }
                             Err(e) => {
                                 self.state = AppState::Error(format!("❌ Download failed: {}", e));
@@ -239,6 +241,39 @@ impl YtMp3App {
                 .ok();
         }
     }
+
+    fn open_file_location(&self) {
+        if let AppState::Success(ref file_path) = self.state {
+            #[cfg(target_os = "windows")]
+            {
+                std::process::Command::new("explorer")
+                    .arg(format!("/select,\"{}\"", file_path))
+                    .spawn()
+                    .ok();
+            }
+            
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("open")
+                    .arg("-R")
+                    .arg(file_path)
+                    .spawn()
+                    .ok();
+            }
+            
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(parent) = Path::new(file_path).parent() {
+                    if let Some(parent_str) = parent.to_str() {
+                        std::process::Command::new("xdg-open")
+                            .arg(parent_str)
+                            .spawn()
+                            .ok();
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for YtMp3App {
@@ -247,7 +282,7 @@ impl eframe::App for YtMp3App {
 
         let mut state_change = None;
         let mut should_start_download = false;
-        let mut should_open_folder = false;
+        let mut should_open_location = false;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(10.0);
@@ -457,16 +492,16 @@ impl eframe::App for YtMp3App {
                         }
                     });
                 }
-                AppState::Success(message) => {
+                AppState::Success(path) => {
                     ui.vertical_centered(|ui| {
                         ui.add_space(20.0);
-                        ui.colored_label(egui::Color32::GREEN, message);
+                        ui.colored_label(egui::Color32::GREEN, format!("✅ Download completed successfully!\nSaved to: {}", path));
                         ui.add_space(15.0);
                         
                         ui.horizontal(|ui| {
-                            if ui.add_sized([180.0, 40.0], egui::Button::new("📁 Open Folder"))
+                            if ui.add_sized([180.0, 40.0], egui::Button::new("📁 Open File Location"))
                                 .clicked() {
-                                should_open_folder = true;
+                                should_open_location = true;
                             }
                             
                             ui.add_space(10.0);
@@ -493,8 +528,8 @@ impl eframe::App for YtMp3App {
         }
         
         // Handle folder opening separately
-        if should_open_folder {
-            self.open_download_folder();
+        if should_open_location {
+            self.open_file_location();
         }
 
         // Request repaint to handle async updates
@@ -598,6 +633,8 @@ fn download_video(
         "Starting download...".to_string(),
     )).ok();
 
+    let downloaded_file = Arc::new(Mutex::new(None::<String>));
+
     let output_template = format!("{}\\%(title)s.%(ext)s", output_path);
     let mut args = vec![
         "--newline",
@@ -637,17 +674,27 @@ fn download_video(
     let progress_tx = progress_sender.clone();
     let console_tx = progress_sender.clone();
     
-    let progress_thread = thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                // Send raw line to console output
-                console_tx.send(AppMessage::ConsoleOutput(line.clone())).ok();
-                
-                // Parse for progress updates
-                if let Some((progress, status)) = parse_progress_line(&line) {
-                    progress_tx.send(AppMessage::DownloadProgress(progress, status)).ok();
+    let progress_thread = thread::spawn({
+        let progress_tx = progress_sender.clone();
+        let console_tx = progress_sender.clone();
+        let df_clone = downloaded_file.clone();
+        move || {
+            let reader = BufReader::new(stdout);
+            
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    console_tx.send(AppMessage::ConsoleOutput(line.clone())).ok();
+                    
+                    if line.contains("Destination:") {
+                        if let Some(pos) = line.find("Destination:") {
+                            let path = line[pos + 12..].trim().to_string();
+                            *df_clone.lock().unwrap() = Some(path);
+                        }
+                    }
+                    
+                    if let Some((progress, status)) = parse_progress_line(&line) {
+                        progress_tx.send(AppMessage::DownloadProgress(progress, status)).ok();
+                    }
                 }
             }
         }
@@ -672,7 +719,9 @@ fn download_video(
     // Wait for both threads to finish
     progress_thread.join().ok();
     error_thread.join().ok();
-
+    
+    let final_path = downloaded_file.lock().unwrap().clone().unwrap_or_else(|| output_path.to_string());
+    
     if !output.status.success() {
         let error_msg = String::from_utf8_lossy(&output.stderr);
         if error_msg.is_empty() {
@@ -689,7 +738,7 @@ fn download_video(
     // Small delay to ensure the final progress message is processed
     thread::sleep(std::time::Duration::from_millis(100));
 
-    Ok(output_path.to_string())
+    Ok(final_path)
 }
 
 fn parse_progress_line(line: &str) -> Option<(f32, String)> {
