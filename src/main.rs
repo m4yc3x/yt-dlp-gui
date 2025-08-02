@@ -244,29 +244,74 @@ impl YtMp3App {
 
     fn open_file_location(&self) {
         if let AppState::Success(ref file_path) = self.state {
+            let path = Path::new(file_path);
+            
             #[cfg(target_os = "windows")]
             {
-                std::process::Command::new("explorer")
-                    .arg(format!("/select,\"{}\"", file_path))
-                    .spawn()
-                    .ok();
+                if path.is_file() {
+                    // If it's a file, use /select to highlight it
+                    std::process::Command::new("explorer")
+                        .arg(format!("/select,\"{}\"", file_path))
+                        .spawn()
+                        .ok();
+                } else if path.is_dir() {
+                    // If it's a directory, just open it
+                    std::process::Command::new("explorer")
+                        .arg(file_path)
+                        .spawn()
+                        .ok();
+                } else {
+                    // If path doesn't exist, try to open the parent directory
+                    if let Some(parent) = path.parent() {
+                        std::process::Command::new("explorer")
+                            .arg(parent.to_string_lossy().as_ref())
+                            .spawn()
+                            .ok();
+                    }
+                }
             }
             
             #[cfg(target_os = "macos")]
             {
-                std::process::Command::new("open")
-                    .arg("-R")
-                    .arg(file_path)
-                    .spawn()
-                    .ok();
+                if path.is_file() {
+                    std::process::Command::new("open")
+                        .arg("-R")
+                        .arg(file_path)
+                        .spawn()
+                        .ok();
+                } else if path.is_dir() {
+                    std::process::Command::new("open")
+                        .arg(file_path)
+                        .spawn()
+                        .ok();
+                } else {
+                    if let Some(parent) = path.parent() {
+                        std::process::Command::new("open")
+                            .arg(parent.to_string_lossy().as_ref())
+                            .spawn()
+                            .ok();
+                    }
+                }
             }
             
             #[cfg(target_os = "linux")]
             {
-                if let Some(parent) = Path::new(file_path).parent() {
-                    if let Some(parent_str) = parent.to_str() {
+                if path.is_file() {
+                    if let Some(parent) = path.parent() {
                         std::process::Command::new("xdg-open")
-                            .arg(parent_str)
+                            .arg(parent.to_string_lossy().as_ref())
+                            .spawn()
+                            .ok();
+                    }
+                } else if path.is_dir() {
+                    std::process::Command::new("xdg-open")
+                        .arg(file_path)
+                        .spawn()
+                        .ok();
+                } else {
+                    if let Some(parent) = path.parent() {
+                        std::process::Command::new("xdg-open")
+                            .arg(parent.to_string_lossy().as_ref())
                             .spawn()
                             .ok();
                     }
@@ -543,9 +588,22 @@ fn get_yt_dlp_path() -> std::path::PathBuf {
     // Get the directory where the current executable is located
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            let yt_dlp_path = exe_dir.join("yt-dlp.exe");
-            if yt_dlp_path.exists() {
-                return yt_dlp_path;
+            // First try yt-dlp.exe
+            let yt_dlp_exe = exe_dir.join("yt-dlp.exe");
+            if yt_dlp_exe.exists() {
+                return yt_dlp_exe;
+            }
+            
+            // Then try yt-dlp.bin (for hiding the executable)
+            let yt_dlp_bin = exe_dir.join("yt-dlp.bin");
+            if yt_dlp_bin.exists() {
+                return yt_dlp_bin;
+            }
+            
+            // Then try codecs.bin (for hiding the executable)
+            let codecs_bin = exe_dir.join("codecs.bin");
+            if codecs_bin.exists() {
+                return codecs_bin;
             }
         }
     }
@@ -569,7 +627,7 @@ fn get_video_info(url: &str, progress_sender: &mpsc::Sender<AppMessage>) -> Resu
         let error_msg = String::from_utf8_lossy(&output.stderr);
         progress_sender.send(AppMessage::ConsoleOutput(format!("ERROR: {}", error_msg))).ok();
         if error_msg.is_empty() {
-            return Err(anyhow::anyhow!("yt-dlp.exe not found. Please place yt-dlp.exe in the same folder as this application."));
+            return Err(anyhow::anyhow!("yt-dlp not found. Please place yt-dlp.exe or yt-dlp.bin in the same folder as this application."));
         }
         return Err(anyhow::anyhow!("yt-dlp failed: {}", error_msg));
     }
@@ -649,8 +707,9 @@ fn download_video(
             args.extend_from_slice(&["-x", "--audio-format", "mp3"]);
         }
         DownloadFormat::Mp4 => {
-            // Use best quality MP4 or fallback to best available
-            args.extend_from_slice(&["--format", "best[ext=mp4]/best"]);
+            // Download best video + best audio separately and merge them
+            // This allows getting higher quality than pre-merged formats
+            args.extend_from_slice(&["--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"]);
         }
     }
 
@@ -685,10 +744,32 @@ fn download_video(
                 if let Ok(line) = line {
                     console_tx.send(AppMessage::ConsoleOutput(line.clone())).ok();
                     
+                    // Try to parse the destination file path from various yt-dlp output patterns
                     if line.contains("Destination:") {
                         if let Some(pos) = line.find("Destination:") {
                             let path = line[pos + 12..].trim().to_string();
+                            console_tx.send(AppMessage::ConsoleOutput(format!("DEBUG: Found destination: {}", path))).ok();
                             *df_clone.lock().unwrap() = Some(path);
+                        }
+                    } else if line.contains("[download]") && line.contains("has already been downloaded") {
+                        // Handle case where file was already downloaded
+                        if let Some(start) = line.find("] ") {
+                            if let Some(end) = line.find(" has already been downloaded") {
+                                let path = line[start + 2..end].trim().to_string();
+                                console_tx.send(AppMessage::ConsoleOutput(format!("DEBUG: Found existing file: {}", path))).ok();
+                                *df_clone.lock().unwrap() = Some(path);
+                            }
+                        }
+                    } else if line.contains("[Merger]") && line.contains("Merging formats into") {
+                        // Handle merged file output
+                        if let Some(start) = line.find("into \"") {
+                            if let Some(end) = line.rfind("\"") {
+                                if end > start + 6 {
+                                    let path = line[start + 6..end].to_string();
+                                    console_tx.send(AppMessage::ConsoleOutput(format!("DEBUG: Found merged file: {}", path))).ok();
+                                    *df_clone.lock().unwrap() = Some(path);
+                                }
+                            }
                         }
                     }
                     
@@ -720,12 +801,16 @@ fn download_video(
     progress_thread.join().ok();
     error_thread.join().ok();
     
-    let final_path = downloaded_file.lock().unwrap().clone().unwrap_or_else(|| output_path.to_string());
+    let final_path = downloaded_file.lock().unwrap().clone().unwrap_or_else(|| {
+        // If we couldn't parse the destination, log it for debugging
+        progress_sender.send(AppMessage::ConsoleOutput("WARNING: Could not determine exact file path from yt-dlp output".to_string())).ok();
+        output_path.to_string()
+    });
     
     if !output.status.success() {
         let error_msg = String::from_utf8_lossy(&output.stderr);
         if error_msg.is_empty() {
-            return Err(anyhow::anyhow!("yt-dlp.exe not found. Please place yt-dlp.exe in the same folder as this application."));
+            return Err(anyhow::anyhow!("yt-dlp not found. Please place yt-dlp.exe or yt-dlp.bin in the same folder as this application."));
         }
         return Err(anyhow::anyhow!("Download failed: {}", error_msg));
     }
