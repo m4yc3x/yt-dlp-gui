@@ -125,7 +125,20 @@ impl YtMp3App {
             // First, check and update yt-dlp
             let rt = tokio::runtime::Runtime::new().unwrap();
             if let Err(e) = rt.block_on(check_and_update_yt_dlp(&tx)) {
-                tx.send(AppMessage::ConsoleOutput(format!("Update check failed (continuing anyway): {}", e))).ok();
+                tx.send(AppMessage::ConsoleOutput(format!("Update check failed: {}", e))).ok();
+
+                // Check if yt-dlp exists at all
+                let yt_dlp_path = get_yt_dlp_path();
+                if !yt_dlp_path.exists() {
+                    tx.send(AppMessage::VideoInfoReceived(
+                        Err(anyhow::anyhow!("yt-dlp is not installed and could not be downloaded. Error: {}", e))
+                    )).ok();
+                    return;
+                } else {
+                    tx.send(AppMessage::ConsoleOutput(
+                        format!("Continuing with existing yt-dlp at: {}", yt_dlp_path.display())
+                    )).ok();
+                }
             }
 
             // Then fetch video info
@@ -252,13 +265,14 @@ impl YtMp3App {
     fn open_file_location(&self) {
         if let AppState::Success(ref file_path) = self.state {
             let path = Path::new(file_path);
-            
+
             #[cfg(target_os = "windows")]
             {
                 if path.is_file() {
-                    // If it's a file, use /select to highlight it
+                    // If it's a file, use /select, to highlight it in Windows Explorer
                     std::process::Command::new("explorer")
-                        .arg(format!("/select,\"{}\"", file_path))
+                        .arg("/select,")
+                        .arg(file_path)
                         .spawn()
                         .ok();
                 } else if path.is_dir() {
@@ -268,7 +282,7 @@ impl YtMp3App {
                         .spawn()
                         .ok();
                 } else {
-                    // If path doesn't exist, try to open the parent directory
+                    // If path doesn't exist, try to open the parent directory and select nothing
                     if let Some(parent) = path.parent() {
                         std::process::Command::new("explorer")
                             .arg(parent.to_string_lossy().as_ref())
@@ -667,20 +681,42 @@ async fn get_latest_yt_dlp_release() -> Result<GitHubRelease> {
     Ok(release)
 }
 
-async fn download_yt_dlp(url: &str, dest_path: &std::path::Path) -> Result<()> {
+async fn download_yt_dlp(url: &str, dest_path: &std::path::Path, progress_sender: &mpsc::Sender<AppMessage>) -> Result<()> {
+    progress_sender.send(AppMessage::ConsoleOutput(format!("Download URL: {}", url))).ok();
+    progress_sender.send(AppMessage::ConsoleOutput(format!("Destination: {}", dest_path.display()))).ok();
+
     let client = reqwest::Client::builder()
         .user_agent("ytmp3-downloader")
+        .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout
         .build()?;
 
+    progress_sender.send(AppMessage::ConsoleOutput("Sending download request...".to_string())).ok();
     let response = client.get(url).send().await?;
+
+    progress_sender.send(AppMessage::ConsoleOutput(format!("Response status: {}", response.status()))).ok();
     let bytes = response.bytes().await?;
+
+    progress_sender.send(AppMessage::ConsoleOutput(format!("Downloaded {} bytes", bytes.len()))).ok();
 
     // Create parent directory if it doesn't exist
     if let Some(parent) = dest_path.parent() {
+        progress_sender.send(AppMessage::ConsoleOutput(format!("Creating directory: {}", parent.display()))).ok();
         std::fs::create_dir_all(parent)?;
     }
 
+    progress_sender.send(AppMessage::ConsoleOutput("Writing file...".to_string())).ok();
     std::fs::write(dest_path, bytes)?;
+
+    // Verify the file was written successfully
+    if dest_path.exists() {
+        let metadata = std::fs::metadata(dest_path)?;
+        progress_sender.send(AppMessage::ConsoleOutput(
+            format!("File written successfully: {} bytes", metadata.len())
+        )).ok();
+    } else {
+        return Err(anyhow::anyhow!("File was not created at {}", dest_path.display()));
+    }
+
     Ok(())
 }
 
@@ -731,11 +767,26 @@ async fn check_and_update_yt_dlp(progress_sender: &mpsc::Sender<AppMessage>) -> 
     let codecs_dir = get_codecs_dir()?;
     let dest_path = codecs_dir.join("yt-dlp.exe");
 
-    download_yt_dlp(&yt_dlp_asset.browser_download_url, &dest_path).await?;
+    download_yt_dlp(&yt_dlp_asset.browser_download_url, &dest_path, progress_sender).await?;
 
     progress_sender.send(AppMessage::ConsoleOutput(
         format!("Successfully downloaded yt-dlp {} to {}", latest_version, dest_path.display())
     )).ok();
+
+    // Verify yt-dlp works by checking version
+    progress_sender.send(AppMessage::ConsoleOutput("Verifying yt-dlp installation...".to_string())).ok();
+    match get_current_yt_dlp_version().await {
+        Some(version) => {
+            progress_sender.send(AppMessage::ConsoleOutput(
+                format!("Verification successful! yt-dlp version: {}", version)
+            )).ok();
+        }
+        None => {
+            progress_sender.send(AppMessage::ConsoleOutput(
+                "WARNING: Could not verify yt-dlp installation".to_string()
+            )).ok();
+        }
+    }
 
     Ok(())
 }
