@@ -113,15 +113,22 @@ impl YtMp3App {
         }
 
         let url = self.url_input.clone();
-        
+
         // Clear previous console output
         self.console_output.clear();
-        
+
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         self.state = AppState::Loading;
 
         thread::spawn(move || {
+            // First, check and update yt-dlp
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            if let Err(e) = rt.block_on(check_and_update_yt_dlp(&tx)) {
+                tx.send(AppMessage::ConsoleOutput(format!("Update check failed (continuing anyway): {}", e))).ok();
+            }
+
+            // Then fetch video info
             let result = get_video_info(&url, &tx);
             tx.send(AppMessage::VideoInfoReceived(result)).ok();
         });
@@ -588,28 +595,149 @@ fn get_yt_dlp_path() -> std::path::PathBuf {
     // Get the directory where the current executable is located
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            // First try yt-dlp.exe
+            // Check in codecs.bin folder first
+            let codecs_dir = exe_dir.join("codecs.bin");
+            let yt_dlp_in_codecs = codecs_dir.join("yt-dlp.exe");
+            if yt_dlp_in_codecs.exists() {
+                return yt_dlp_in_codecs;
+            }
+
+            // Legacy: check for yt-dlp.exe in root
             let yt_dlp_exe = exe_dir.join("yt-dlp.exe");
             if yt_dlp_exe.exists() {
                 return yt_dlp_exe;
             }
-            
-            // Then try yt-dlp.bin (for hiding the executable)
-            let yt_dlp_bin = exe_dir.join("yt-dlp.bin");
-            if yt_dlp_bin.exists() {
-                return yt_dlp_bin;
-            }
-            
-            // Then try codecs.bin (for hiding the executable)
-            let codecs_bin = exe_dir.join("codecs.bin");
-            if codecs_bin.exists() {
-                return codecs_bin;
-            }
         }
     }
-    
-    // Fallback to just "yt-dlp" if not found next to exe
+
+    // Fallback to just "yt-dlp" if not found
     std::path::PathBuf::from("yt-dlp")
+}
+
+fn get_codecs_dir() -> Result<std::path::PathBuf> {
+    let exe_path = std::env::current_exe()?;
+    let exe_dir = exe_path.parent()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine executable directory"))?;
+    Ok(exe_dir.join("codecs.bin"))
+}
+
+async fn get_current_yt_dlp_version() -> Option<String> {
+    let yt_dlp_path = get_yt_dlp_path();
+
+    if !yt_dlp_path.exists() {
+        return None;
+    }
+
+    let mut command = Command::new(&yt_dlp_path);
+    command.arg("--version");
+    #[cfg(target_os = "windows")]
+    command.creation_flags(0x08000000);
+
+    match command.output() {
+        Ok(output) if output.status.success() => {
+            String::from_utf8(output.stdout).ok().map(|s| s.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+async fn get_latest_yt_dlp_release() -> Result<GitHubRelease> {
+    let client = reqwest::Client::builder()
+        .user_agent("ytmp3-downloader")
+        .build()?;
+
+    let response = client
+        .get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest")
+        .send()
+        .await?;
+
+    let release: GitHubRelease = response.json().await?;
+    Ok(release)
+}
+
+async fn download_yt_dlp(url: &str, dest_path: &std::path::Path) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .user_agent("ytmp3-downloader")
+        .build()?;
+
+    let response = client.get(url).send().await?;
+    let bytes = response.bytes().await?;
+
+    // Create parent directory if it doesn't exist
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::write(dest_path, bytes)?;
+    Ok(())
+}
+
+async fn check_and_update_yt_dlp(progress_sender: &mpsc::Sender<AppMessage>) -> Result<()> {
+    progress_sender.send(AppMessage::ConsoleOutput("Checking for yt-dlp updates...".to_string())).ok();
+
+    // Get current version
+    let current_version = get_current_yt_dlp_version().await;
+    progress_sender.send(AppMessage::ConsoleOutput(
+        format!("Current version: {}", current_version.as_deref().unwrap_or("not installed"))
+    )).ok();
+
+    // Get latest release info
+    let release = match get_latest_yt_dlp_release().await {
+        Ok(r) => r,
+        Err(e) => {
+            progress_sender.send(AppMessage::ConsoleOutput(
+                format!("Could not check for updates: {}", e)
+            )).ok();
+            return Err(e);
+        }
+    };
+
+    let latest_version = release.tag_name.clone();
+    progress_sender.send(AppMessage::ConsoleOutput(
+        format!("Latest version: {}", latest_version)
+    )).ok();
+
+    // Check if we need to update
+    let needs_update = current_version.is_none() ||
+        current_version.as_ref() != Some(&latest_version);
+
+    if !needs_update {
+        progress_sender.send(AppMessage::ConsoleOutput("yt-dlp is up to date!".to_string())).ok();
+        return Ok(());
+    }
+
+    // Find the Windows executable in the assets
+    let yt_dlp_asset = release.assets.iter()
+        .find(|asset| asset.name == "yt-dlp.exe")
+        .ok_or_else(|| anyhow::anyhow!("Could not find yt-dlp.exe in latest release"))?;
+
+    progress_sender.send(AppMessage::ConsoleOutput(
+        format!("Downloading yt-dlp {}...", latest_version)
+    )).ok();
+
+    // Download to codecs.bin folder
+    let codecs_dir = get_codecs_dir()?;
+    let dest_path = codecs_dir.join("yt-dlp.exe");
+
+    download_yt_dlp(&yt_dlp_asset.browser_download_url, &dest_path).await?;
+
+    progress_sender.send(AppMessage::ConsoleOutput(
+        format!("Successfully downloaded yt-dlp {} to {}", latest_version, dest_path.display())
+    )).ok();
+
+    Ok(())
 }
 
 fn get_video_info(url: &str, progress_sender: &mpsc::Sender<AppMessage>) -> Result<VideoInfo> {
@@ -730,9 +858,7 @@ fn download_video(
     // Read stdout in a separate thread to parse progress
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let progress_tx = progress_sender.clone();
-    let console_tx = progress_sender.clone();
-    
+
     let progress_thread = thread::spawn({
         let progress_tx = progress_sender.clone();
         let console_tx = progress_sender.clone();
